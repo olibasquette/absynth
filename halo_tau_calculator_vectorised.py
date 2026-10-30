@@ -13,6 +13,22 @@ import itertools
 #juliapkg.add("Zygote", uuid="e88e6eb3-aa80-5325-afca-941959d7151f")#
 #juliapkg.resolve()
 
+from colossus.cosmology import cosmology
+from colossus.halo import concentration
+
+# Uchuu cosmology: Ishiyama et al. (2021)
+uchuu_params = {
+    'flat': True,
+    'H0': 67.74,
+    'Om0': 0.3089,
+    'Ob0': 0.0486,
+    'sigma8': 0.8159,
+    'ns': 0.9667,
+}
+
+cosmology.addCosmology('uchuu', uchuu_params)
+cosmology.setCosmology('uchuu')
+
 #%% Conversion factors and other constants
 
 n_halo_masses = 50
@@ -129,6 +145,54 @@ def conc_fit_duffy(x0,x1):
     val = 5.71 * (x0/pivot_mass)**(-0.084) * (1+x1)**(-0.47)
     return val
 
+def conc_fit_amodeo(M,z):
+    A = 1.34
+    B = -0.53
+    C = -0.57
+    logc200 = A + B*np.log10(M/1e14) + C*np.log10(1+z)
+    c200 = 10**logc200
+    return c200
+
+def c200_uchuu(M200, z):
+    """
+    Uchuu/Ishiyama+2021 c_200(M_200, z).
+
+    Parameters
+    ----------
+    M200 : float or array
+        M_200c in solar masses (Msun).
+    z : float
+        Redshift.
+
+    Returns
+    -------
+    c200 : float or array
+        Median NFW concentration R_200c / r_s.
+
+    Notes
+    -----
+    Uses the NFW profile-fit calibration for all haloes.
+    """
+
+    h = 0.6774
+
+    # Colossus performs some calculations in place, so it cannot internally
+    # broadcast differently shaped mass and redshift arrays. Broadcast them
+    # here, then pass matching one-dimensional arrays and restore the grid.
+    M200_grid, z_grid = np.broadcast_arrays(
+        np.asarray(M200, dtype=float),
+        np.asarray(z, dtype=float),
+    )
+    c200 = concentration.concentration(
+        (M200_grid * h).ravel(),
+        '200c',
+        z_grid.ravel(),
+        model='ishiyama21',
+        c_type='fit',
+        halo_sample='all',
+    )
+    return np.asarray(c200).reshape(M200_grid.shape)
+
 def rho_gas(Mvir_Msun, r200, conc, rho_c, mu, Tvir, r):
     Mvir = Mvir_Msun * M_SUN_TO_GRAMS  # g
     c = conc
@@ -139,26 +203,28 @@ def rho_gas(Mvir_Msun, r200, conc, rho_c, mu, Tvir, r):
     r_bins = np.logspace(np.log10(r200), np.log10(r), 100)
     x_bins = r_bins / r200
     integrand = f(c * x_bins) / (r_bins**2)
-    integral = np.trapz(integrand*r_bins, np.log(r_bins), axis=0)
+    integral = np.trapezoid(integrand*r_bins, np.log(r_bins), axis=0)
     rho_gas_r = prefactor * np.exp(constants * integral)
     return rho_gas_r  # g/cm^3
 
 #%% formula for the NFW dark matter density profile
 
-def rho_NFW(z, Mvir_Msun, r):
+'''
+def rho_NFW(z, Mvir_Msun, r): # UNUSED!!!
     rho_c = Planck15.critical_density(z).to(u.g / u.cm**3).value  # g/cm^3
     delta_c = 200
     r200 = get_r200(Mvir_Msun, z)  # cm
     c = conc_fit_ragagnin(Mvir_Msun, z)
     rs = r200 / c # scale radius in cm
     return (rho_c * delta_c)/(r/rs * (1 + r/rs)**2)  # g/cm^3
+'''
 
 # %%
 
-# Adopt Ragagnin fit for the concentration parameter
+# Adopt fit for the concentration parameter
 # Calculate tau(z, Mvir, xHI, freq) using this fit
 
-def get_integrand_grid(nu_arr, z_arr, Mvir_Msun_arr, xHI_arr):
+def get_integrand_grid(nu_arr, z_arr, Mvir_Msun_arr, xHI_arr, concentration_model='uchuu'):
 
     tau_arr = np.zeros((len(nu_arr),len(z_arr),len(Mvir_Msun_arr),len(xHI_arr)))
     
@@ -180,7 +246,10 @@ def get_integrand_grid(nu_arr, z_arr, Mvir_Msun_arr, xHI_arr):
     #print(r200_arr)
 
     # compute concentration for all Mvir and z
-    conc_arr = conc_fit_duffy(Mvir_Msun_arr[:,None], z_arr[None,:])  # dimensionless
+    #conc_arr = conc_fit_duffy(Mvir_Msun_arr[:,None], z_arr[None,:])  # dimensionless
+    #conc_arr = conc_fit_amodeo(Mvir_Msun_arr[:,None], z_arr[None,:])  # dimensionless
+    concentration_models = {'duffy': conc_fit_duffy, 'uchuu': c200_uchuu}
+    conc_arr = concentration_models[concentration_model](Mvir_Msun_arr[:,None], z_arr[None,:])  # dimensionless
     #print(f"concentration array shape: {conc_arr.shape}")
     #print(conc_arr)
 
@@ -208,14 +277,15 @@ def get_integrand_grid(nu_arr, z_arr, Mvir_Msun_arr, xHI_arr):
     
     # compute integrand for all nu, xHI, Mvir, z, r
     integrand_arr = rho_gas_arr[None,:,:,:,:] * ((FH / PROTON_MASS) * xHI_arr[None,:,None,None,None] * cross_sections_HI[:,None,None,None,None] +
-                                                 (FHE / (4*PROTON_MASS)) * xHI_arr[None,:,None,None,None]/4 * cross_sections_HeI[:,None,None,None,None] +
-                                                 (FHE / (4*PROTON_MASS)) * (1 - xHI_arr[None,:,None,None,None])/2 * cross_sections_HeII[:,None,None,None,None])  # cm^-1
+                                                 (FHE / (4*PROTON_MASS)) * xHI_arr[None,:,None,None,None] * cross_sections_HeI[:,None,None,None,None] +
+                                                 (FHE / (4*PROTON_MASS)) * (1 - xHI_arr[None,:,None,None,None]) * cross_sections_HeII[:,None,None,None,None])  # cm^-1
     print(f"integrand array shape: {integrand_arr.shape}")
     #print(integrand_arr)
     return integrand_arr, radii_arr
 
 #%%
 
-integrand_arr, radii_arr = get_integrand_grid(coarse_freqs, redshift_bins_wide, halo_masses_Msun, xHI_bins)
-np.save("integrand_arr.npy", integrand_arr)
-np.save("radii_arr.npy", radii_arr)
+if __name__ == '__main__':
+    integrand_arr, radii_arr = get_integrand_grid(coarse_freqs, redshift_bins_wide, halo_masses_Msun, xHI_bins)
+    np.save("integrand_arr_uchuu.npy", integrand_arr)
+    np.save("radii_arr_uchuu.npy", radii_arr)
